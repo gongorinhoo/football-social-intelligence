@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import Link from "next/link";
 
 type Club = {
   id: number;
@@ -133,6 +134,7 @@ export default function ClubTable({ clubs }: Props) {
                 <th className="px-5 py-4">TikTok</th>
                 <th className="px-5 py-4">Liga</th>
                 <th className="px-5 py-4">Status</th>
+                <th className="px-5 py-4">Akcje</th>
               </tr>
             </thead>
 
@@ -147,7 +149,18 @@ export default function ClubTable({ clubs }: Props) {
                   </td>
 
                   <td className="px-5 py-4 font-medium text-white">
-                    {club.name}
+                    <Link
+                      href={`/panel/kluby/${club.id}`}
+                      className="hover:text-emerald-400"
+                    >
+                      {club.name}
+                    </Link>
+                    <Link
+                      href={`/panel/kluby/${club.id}`}
+                      className="inline-block rounded-lg border border-emerald-300/30 px-3 py-2 text-xs font-medium text-emerald-400 transition hover:bg-emerald-500/10"
+                    >
+                      Zobacz profil →
+                    </Link>
                   </td>
 
                   <td className="px-5 py-4">

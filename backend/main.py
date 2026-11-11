@@ -1,7 +1,7 @@
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -78,3 +78,26 @@ def get_clubs(db: Session = Depends(get_db)):
         }
         for club in clubs
     ]
+
+# Pobieranie szczegółów jednego klubu
+@app.get("/api/clubs/{club_id}")
+def get_club(
+    club_id: int,
+    db: Session = Depends(get_db)
+):
+    club = db.get(Club, club_id)
+
+    if club is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Nie znaleziono klubu"
+        )
+
+    return {
+        "id": club.id,
+        "name": club.name,
+        "tiktok_handle": club.tiktok_handle,
+        "league": club.league,
+        "is_active": club.is_active,
+        "created_at": club.created_at.isoformat()
+    }
