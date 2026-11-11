@@ -1,0 +1,44 @@
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Next.js
+node_modules/
+.next/
+out/
+build/
+dist/
+
+# Hasla i konfiguracja
+.env
+.env.*
+!.env.example
+
+# TikTok cookies / sesje
+cookies.txt
+cookies*.txt
+*.session
+storage_state.json
+playwright/.auth/
+
+# Prywatne pliki
+backend/uploads/
+storage/uploads/
+*.mp4
+*.mov
+
+# Bazy i backupy
+*.db
+*.sqlite
+*.sqlite3
+*.sql.gz
+
+# Logi
+*.log
+
+# System
+.DS_Store
+Thumbs.db
