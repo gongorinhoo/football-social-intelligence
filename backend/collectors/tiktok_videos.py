@@ -1,3 +1,6 @@
+class VideoOutsideDateRange(ValueError):
+    """Film został opublikowany poza wybranym okresem."""
+    pass
 
 import argparse
 import os
@@ -134,7 +137,7 @@ def zapisz_film(
             ).date()
 
             if video_date < start:
-                raise ValueError(
+                raise VideoOutsideDateRange(
                     "Film opublikowany przed wybranym okresem"
                 )
 
@@ -144,7 +147,7 @@ def zapisz_film(
             ).date()
 
             if video_date > end:
-                raise ValueError(
+                raise VideoOutsideDateRange(
                     "Film opublikowany po wybranym okresie"
                 )
 

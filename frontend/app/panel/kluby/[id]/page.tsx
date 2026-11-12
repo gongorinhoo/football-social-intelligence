@@ -2,6 +2,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import FollowersPanel from "./FollowersPanel";
+import VideoAnalytics from "./VideoAnalitycs";
 
 type Club = {
   id: number;
@@ -203,6 +204,7 @@ export default async function ClubProfilePage({
 
         {/* Miejsce na historię */}
         <FollowersPanel clubId={club.id} />
+        <VideoAnalytics clubId={club.id} />
 
         {/* Przyszłe moduły */}
         <section className="grid gap-4 md:grid-cols-2">
