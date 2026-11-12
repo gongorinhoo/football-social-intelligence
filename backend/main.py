@@ -3,11 +3,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select, text
+from sqlalchemy import select, text, desc
 from sqlalchemy.orm import Session
 
 from database import Base, engine, get_db
-from models import Club
+from models import Club, ProfileSnapshot
 
 
 @asynccontextmanager
@@ -100,4 +100,66 @@ def get_club(
         "league": club.league,
         "is_active": club.is_active,
         "created_at": club.created_at.isoformat()
+    }
+
+
+@app.get("/api/clubs/{club_id}/followers")
+def get_club_followers(
+    club_id: int,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    club = db.get(Club, club_id)
+
+    if club is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Nie znaleziono klubu"
+        )
+
+    limit = max(1, min(limit, 1000))
+
+    snapshots = db.scalars(
+        select(ProfileSnapshot)
+        .where(ProfileSnapshot.club_id == club_id)
+        .order_by(desc(ProfileSnapshot.collected_at),
+                  desc(ProfileSnapshot.id))
+        .limit(limit)
+    ).all()
+
+    history = [
+        {
+            "id": snapshot.id,
+            "followers_count": snapshot.followers_count,
+            "likes_count": snapshot.likes_count,
+            "collected_at": snapshot.collected_at.isoformat() + "Z"
+        }
+        for snapshot in reversed(snapshots)
+    ]
+
+    latest = history[-1] if history else None
+
+    # Porównanie dwóch ostatnich dostępnych pomiarów
+    growth = None
+
+    if len(history) >= 2:
+        previous = history[-2]
+        current = history[-1]
+
+        if (
+            current["followers_count"] is not None
+            and previous["followers_count"] is not None
+        ):
+            growth = (
+                current["followers_count"]
+                - previous["followers_count"]
+            )
+
+    return {
+        "club_id": club.id,
+        "club_name": club.name,
+        "tiktok_handle": club.tiktok_handle,
+        "latest": latest,
+        "growth_since_previous_snapshot": growth,
+        "history": history
     }

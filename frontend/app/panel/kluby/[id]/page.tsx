@@ -1,6 +1,7 @@
 
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import FollowersPanel from "./FollowersPanel";
 
 type Club = {
   id: number;
@@ -201,24 +202,7 @@ export default async function ClubProfilePage({
         </section>
 
         {/* Miejsce na historię */}
-        <section className="mb-10">
-          <div className="rounded-xl border border-white/10 bg-[#111923] p-6">
-            <h2 className="text-xl font-semibold">
-              Historia wyświetleń
-            </h2>
-
-            <div className="flex min-h-64 flex-col items-center justify-center text-center">
-              <p className="text-lg text-slate-300">
-                Brak danych historycznych
-              </p>
-
-              <p className="mt-2 max-w-md text-sm text-slate-500">
-                Wykres pojawi się po rozpoczęciu
-                automatycznego zbierania statystyk TikTok.
-              </p>
-            </div>
-          </div>
-        </section>
+        <FollowersPanel clubId={club.id} />
 
         {/* Przyszłe moduły */}
         <section className="grid gap-4 md:grid-cols-2">
