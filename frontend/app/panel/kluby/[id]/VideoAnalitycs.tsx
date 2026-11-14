@@ -397,16 +397,21 @@ export default function VideoAnalytics({
                       </td>
                       <td className="px-4 py-4">
                         <button
-                          onClick={() =>
-                            setSelectedVideoId(video.id)
-                          }
-                          className="rounded-lg border border-emerald-500/30 px-3 py-2 text-sm font-medium text-emerald-400 hover:bg-emerald-500/10"
+                          type="button"
+                          onClick={() => setSelectedVideoId(video.id)}
+                          className={`rounded-lg border px-3 py-2 text-sm font-medium transition ${
+                            selectedVideoId === video.id
+                              ? "border-emerald-400 bg-emerald-500/20 text-emerald-300"
+                              : "border-emerald-500/30 text-emerald-400 hover:bg-emerald-500/10"
+                          }`}
                         >
-                          Historia
+                          {selectedVideoId === video.id
+                            ? "Wyświetlana historia"
+                            : "Historia"}
                         </button>
-                      </td>
-                    </tr>
-                  ))}
+                        </td>
+                      </tr>
+                    ))}
 
                   {videos.length === 0 && (
                     <tr>
@@ -422,14 +427,15 @@ export default function VideoAnalytics({
               </table>
             </div>
           </div>
-            {selectedVideoId !== null && (
-                <VideoHistory
-                key={selectedVideoId}
-                clubId={clubId}
-                videoId={selectedVideoId}
-                onClose={() => setSelectedVideoId(null)}
-                />
-            )}
+          {/* Jeden panel historii – poza pętlą filmów */}
+          {selectedVideoId !== null && (
+            <VideoHistory
+              key={selectedVideoId}
+              videoId={selectedVideoId}
+              onClose={() => setSelectedVideoId(null)}
+            />
+          )}
+
           {/* Paginacja */}
           <div className="flex items-center justify-between">
             <span className="text-sm text-slate-500">
