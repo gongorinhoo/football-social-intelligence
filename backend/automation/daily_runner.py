@@ -1,178 +1,333 @@
 import argparse
 import asyncio
-from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timezone
-from pathlib import Path
+import logging
 import sys
 import time
-import traceback
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from sqlalchemy import func, select
 
+from database import SessionLocal
+from models import Club, ProfileSnapshot, Video, VideoSnapshot
+
 from collectors.tiktok_followers import wykonaj_pomiar
 from collectors.tiktok_videos import zapisz_film
-from database import SessionLocal
-from models import Club, ProfileSnapshot, Video
 
 
+# Katalog backend/
 BACKEND_DIR = Path(__file__).resolve().parents[1]
-LOG_DIR = BACKEND_DIR / "logs"
+
+# Katalog backend/logs/
+LOGS_DIR = BACKEND_DIR / "logs"
+
+logger = logging.getLogger("fsi.automation")
 
 
-class Tee:
-    """Zapisuje standardowe komunikaty do terminala i pliku logu."""
+def setup_logging():
+    """
+    Logowanie do terminala i do pliku.
+    Rotacja zapobiega nieograniczonemu rozrastaniu się logów.
+    """
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-    def __init__(self, *streams):
-        self.streams = streams
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s"
+    )
 
-    def write(self, message):
-        for stream in self.streams:
-            stream.write(message)
-        return len(message)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
 
-    def flush(self):
-        for stream in self.streams:
-            stream.flush()
+    file_handler = RotatingFileHandler(
+        LOGS_DIR / "fsi_daily.log",
+        maxBytes=2_000_000,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
 
-
-def log(message: str) -> None:
-    current_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[{current_utc}] {message}", flush=True)
-
-
-def count_profile_snapshots(club_id: int) -> int:
-    with SessionLocal() as db:
-        return db.scalar(
-            select(func.count(ProfileSnapshot.id)).where(
-                ProfileSnapshot.club_id == club_id
-            )
-        ) or 0
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
+    logger.propagate = False
 
 
-def get_club_and_videos(handle: str, limit: int):
-    """Zwraca klub i kilka najnowszych, JUŻ ZNANYCH filmów."""
+def get_collection_plan(handle, max_videos):
+    """
+    Znajduje aktywny klub i jego najnowsze znane filmy.
+    Niczego nie zapisuje do bazy.
+    """
     with SessionLocal() as db:
         club = db.scalar(
             select(Club).where(
                 Club.tiktok_handle == handle,
-                Club.is_active.is_(True)
+                Club.is_active.is_(True),
             )
         )
+
         if club is None:
-            raise ValueError(f"Nie znaleziono aktywnego klubu @{handle} w MySQL")
+            raise ValueError(
+                f"Nie znaleziono aktywnego klubu @{handle}"
+            )
 
-        video_rows = db.execute(
-            select(Video.id, Video.url)
+        videos = db.scalars(
+            select(Video)
             .where(Video.club_id == club.id)
-            .order_by(Video.published_at.desc(), Video.id.desc())
-            .limit(limit)
+            .order_by(
+                Video.published_at.desc(),
+                Video.id.desc(),
+            )
+            .limit(max_videos)
         ).all()
-        return club.id, club.name, [(id_, url) for id_, url in video_rows]
+
+        video_plan = [
+            {
+                "id": video.id,
+                "tiktok_video_id": video.tiktok_video_id,
+                "url": video.url,
+            }
+            for video in videos
+        ]
+
+        return club.id, club.name, video_plan
 
 
-def run_job(args) -> int:
-    club_id, club_name, videos = get_club_and_videos(
-        args.handle, args.max_videos
+def count_profile_snapshots(club_id):
+    with SessionLocal() as db:
+        return db.scalar(
+            select(func.count(ProfileSnapshot.id))
+            .where(ProfileSnapshot.club_id == club_id)
+        ) or 0
+
+
+def count_video_snapshots(video_id):
+    with SessionLocal() as db:
+        return db.scalar(
+            select(func.count(VideoSnapshot.id))
+            .where(VideoSnapshot.video_id == video_id)
+        ) or 0
+
+
+async def collect_followers(handle, club_id):
+    """
+    Wywołuje działający kolektor Playwright.
+    Sprawdza, czy faktycznie pojawił się nowy rekord.
+    """
+    logger.info("Rozpoczynam pobieranie obserwujących.")
+
+    before = count_profile_snapshots(club_id)
+
+    try:
+        await wykonaj_pomiar(handle)
+    except Exception:
+        logger.exception(
+            "Wystąpił błąd podczas pobierania obserwujących."
+        )
+        return False
+
+    after = count_profile_snapshots(club_id)
+
+    if after > before:
+        logger.info(
+            "Zapisano nowy pomiar obserwujących. "
+            "Liczba rekordów: %s -> %s",
+            before,
+            after,
+        )
+        return True
+
+    logger.error(
+        "Nie zapisano nowego pomiaru obserwujących."
     )
-    log(f"START: {club_name} (@{args.handle}), tryb={args.mode}")
-    log(f"Ostatnio zebrane filmy do odświeżenia: {len(videos)}")
+    return False
+
+
+def collect_video(video):
+    """
+    Odświeża jeden film przez istniejący kolektor yt-dlp.
+    """
+    video_id = video["id"]
+    tiktok_id = video["tiktok_video_id"]
+
+    logger.info("Rozpoczynam odczyt filmu %s", tiktok_id)
+
+    before = count_video_snapshots(video_id)
+
+    try:
+        zapisz_film(url=video["url"])
+    except Exception:
+        logger.exception(
+            "Nie udało się odświeżyć filmu %s",
+            tiktok_id,
+        )
+        return False
+
+    after = count_video_snapshots(video_id)
+
+    if after > before:
+        logger.info(
+            "Zapisano pomiar filmu %s. Rekordy: %s -> %s",
+            tiktok_id,
+            before,
+            after,
+        )
+        return True
+
+    logger.error(
+        "Nie znaleziono nowego pomiaru dla filmu %s",
+        tiktok_id,
+    )
+    return False
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="FSI – automatyczne zbieranie danych TikTok"
+    )
+
+    parser.add_argument(
+        "--handle",
+        required=True,
+        help="TikTok handle klubu z bazy MySQL",
+    )
+
+    parser.add_argument(
+        "--mode",
+        choices=["followers", "videos", "both"],
+        default="both",
+        help="Rodzaj zbieranych danych",
+    )
+
+    parser.add_argument(
+        "--max-videos",
+        type=int,
+        default=3,
+        help="Maksymalna liczba znanych filmów do odświeżenia",
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Pokaż plan bez pobierania i zapisywania danych",
+    )
+
+    args = parser.parse_args()
+    setup_logging()
+
+    if not 1 <= args.max_videos <= 20:
+        logger.error(
+            "--max-videos musi mieć wartość od 1 do 20."
+        )
+        return 2
+
+    logger.info("=" * 55)
+    logger.info("FOOTBALL SOCIAL INTELLIGENCE – DAILY COLLECTION")
+    logger.info("Data UTC: %s", datetime.now(timezone.utc))
+    logger.info("Klub: @%s", args.handle)
+    logger.info("Tryb: %s", args.mode)
+    logger.info("=" * 55)
+
+    try:
+        club_id, club_name, videos = get_collection_plan(
+            args.handle,
+            args.max_videos,
+        )
+    except Exception:
+        logger.exception(
+            "Nie udało się przygotować planu. "
+            "Sprawdź MySQL i konfigurację bazy."
+        )
+        return 1
+
+    logger.info("Znaleziony klub: %s", club_name)
+    logger.info("Filmy do odświeżenia: %s", len(videos))
 
     if args.dry_run:
-        log("TRYB TESTOWY --dry-run: nie otwieram TikToka i niczego nie zapisuję")
+        logger.info("TRYB TESTOWY – bez odczytów TikToka.")
+
         if args.mode in ("followers", "both"):
-            log("Plan: jeden odczyt obserwujących")
+            logger.info(
+                "PLAN: jeden pomiar obserwujących @%s",
+                args.handle,
+            )
+
         if args.mode in ("videos", "both"):
-            for video_id, url in videos:
-                log(f"Plan: odczyt filmu MySQL #{video_id} – {url}")
-            if not videos:
-                log("Brak filmów w bazie; najpierw uruchom kolektor profilu")
+            for video in videos:
+                logger.info(
+                    "PLAN: film %s, MySQL ID %s",
+                    video["tiktok_video_id"],
+                    video["id"],
+                )
+
+        logger.info("Koniec testu – nie zmieniono danych.")
         return 0
 
-    failures = 0
-    follower_saved = False
+    followers_saved = False
     videos_saved = 0
+    failures = 0
 
+    # ETAP A – obserwujący
     if args.mode in ("followers", "both"):
-        log("Pobieram obserwujących...")
         try:
-            before = count_profile_snapshots(club_id)
-            asyncio.run(wykonaj_pomiar(args.handle))
-            after = count_profile_snapshots(club_id)
-            follower_saved = after > before
-            if follower_saved:
-                log("OK: nowy pomiar obserwujących jest w MySQL")
-            else:
+            followers_saved = asyncio.run(
+                collect_followers(args.handle, club_id)
+            )
+            if not followers_saved:
                 failures += 1
-                log("BŁĄD: nie pojawił się nowy pomiar obserwujących")
         except Exception:
+            logger.exception(
+                "Nieoczekiwany błąd pomiaru obserwujących."
+            )
             failures += 1
-            log("BŁĄD pobierania obserwujących:")
-            traceback.print_exc()
 
+    # ETAP B – statystyki znanych filmów
     if args.mode in ("videos", "both"):
         if not videos:
-            log("INFO: brak znanych filmów do odświeżenia (nie jest to awaria)")
-        else:
-            for index, (video_id, url) in enumerate(videos, start=1):
-                log(f"Odczyt filmu {index}/{len(videos)} (MySQL #{video_id})")
-                try:
-                    zapisz_film(url=url)
+            logger.warning(
+                "Brak znanych filmów klubu w MySQL."
+            )
+            failures += 1
+
+        for index, video in enumerate(videos):
+            logger.info(
+                "Film %s z %s",
+                index + 1,
+                len(videos),
+            )
+
+            try:
+                if collect_video(video):
                     videos_saved += 1
-                    log(f"OK: zapisano nowy pomiar filmu #{video_id}")
-                except Exception:
+                else:
                     failures += 1
-                    log(f"BŁĄD filmu #{video_id}:")
-                    traceback.print_exc()
+            except Exception:
+                logger.exception(
+                    "Nieoczekiwany błąd obsługi filmu."
+                )
+                failures += 1
 
-                if index < len(videos):
-                    time.sleep(args.delay)
+            # Nie wykonujemy kolejnych odczytów bez przerwy.
+            if index < len(videos) - 1:
+                time.sleep(2)
 
-    log(
-        "KONIEC: "
-        f"obserwujący_zapisani={follower_saved}, "
-        f"pomiary_filmów={videos_saved}, błędy={failures}"
+    logger.info("=" * 55)
+    logger.info("PODSUMOWANIE")
+    logger.info("Klub: %s", club_name)
+    logger.info(
+        "Obserwujący – nowy pomiar: %s",
+        "TAK" if followers_saved else "NIE",
     )
+    logger.info(
+        "Zapisane pomiary filmów: %s",
+        videos_saved,
+    )
+    logger.info("Nieudane zadania: %s", failures)
+    logger.info("=" * 55)
+
     return 1 if failures else 0
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="FSI – zaplanowany odczyt TikToka")
-    parser.add_argument("--handle", required=True, help="Handle z tabeli clubs")
-    parser.add_argument(
-        "--mode", choices=("followers", "videos", "both"), default="both"
-    )
-    parser.add_argument(
-        "--max-videos", type=int, default=3,
-        help="Ile najnowszych zapisanych filmów odświeżyć (1–10)"
-    )
-    parser.add_argument(
-        "--delay", type=int, default=3,
-        help="Odstęp między filmami w sekundach (minimum 2)"
-    )
-    parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
-
-    if not 1 <= args.max_videos <= 10:
-        parser.error("--max-videos musi mieścić się w przedziale 1–10")
-    if args.delay < 2:
-        parser.error("--delay musi wynosić co najmniej 2 sekundy")
-
-    LOG_DIR.mkdir(exist_ok=True)
-    filename = datetime.now().strftime("fsi_daily_%Y%m%d_%H%M%S_%f.log")
-    logfile = LOG_DIR / filename
-
-    with logfile.open("w", encoding="utf-8") as output:
-        with redirect_stdout(Tee(sys.stdout, output)), redirect_stderr(
-            Tee(sys.stderr, output)
-        ):
-            log(f"LOG: {logfile}")
-            try:
-                return run_job(args)
-            except Exception:
-                log("BŁĄD KRYTYCZNY: zadanie nie zostało zakończone")
-                traceback.print_exc()
-                return 1
-
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
