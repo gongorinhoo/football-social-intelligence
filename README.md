@@ -16,16 +16,12 @@ performance of Polish football clubs.
 
 - Database of 49 Polish football clubs
 - FastAPI REST API
-- MySQL integration
-- Club directory
-- Search and filtering
-- Dark Analytics interface
-
-## Planned Features
-
 - TikTok video statistics
 - Historical follower tracking
 - Performance dashboards
+
+## Planned Features
+
 - Viral Radar
 - AI Content Predictor
 - Matchday Impact
