@@ -5,7 +5,9 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, text, desc
 from sqlalchemy.orm import Session
+
 from engagement_routes import router as engagement_router
+from rankings_routes import router as rankings_router
 
 from database import Base, engine, get_db
 from models import Club, ProfileSnapshot
@@ -32,6 +34,7 @@ app = FastAPI(
     lifespan=lifespan
 )
 app.include_router(engagement_router)
+app.include_router(rankings_router)
 
 # Połączenie z frontendem Next.js
 app.add_middleware(
