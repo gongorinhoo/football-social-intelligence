@@ -1,6 +1,7 @@
 
 "use client";
 import VideoHistory from "./VideoHistory";
+import EngagementAnalytics from "./EngagementAnalytics";
 import { useEffect, useState } from "react";
 
 type Video = {
@@ -280,6 +281,13 @@ export default function VideoAnalytics({
             {data.summary.videos} filmów. Sumy obejmują
             tylko dostępne liczniki, nie brakujące wartości.
           </p>
+
+          {/* FSI 0.7.2 – wskaźniki dla wszystkich filmów z wybranego okresu */}
+          <EngagementAnalytics
+            clubId={clubId}
+            startDate={filters.start}
+            endDate={filters.end}
+          />
 
           {/* Wykres top filmów */}
           <div className="rounded-xl border border-white/10 bg-[#111923] p-6">
