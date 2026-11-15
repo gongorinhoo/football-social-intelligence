@@ -320,7 +320,7 @@ def start_collection(payload: StartCollection, request: Request):
             sys.executable,
             "-u",
             "-m",
-            "web_collection_routes",
+            "web_collection_worker",
             "--worker-job",
             str(job_id),
         ]
@@ -413,6 +413,14 @@ def prioritize_candidates(candidates, start, end):
 
     return sorted(candidates, key=distance)
 
+def is_cancel_requested(job_id):
+    with SessionLocal() as db:
+        status = db.scalar(
+            select(WebCollectionJob.status)
+            .where(WebCollectionJob.id == job_id)
+        )
+
+        return status == "cancel_requested"
 
 def process_club(job_id, job, club):
     from collectors.tiktok_followers import wykonaj_pomiar
@@ -450,7 +458,7 @@ def process_club(job_id, job, club):
         ).all()
 
     # Opcjonalny aktualny pomiar obserwujących.
-    if job.collect_followers:
+    if job.collect_followers and not is_cancel_requested(job_id):
         update_job(
             job_id,
             message=f"{club.name}: pobieranie obserwujących",
@@ -470,7 +478,7 @@ def process_club(job_id, job, club):
             print(f"Błąd obserwujących @{handle}: {error}")
 
     # Wykrywanie filmów jeszcze nieznanych w MySQL.
-    if job.discover_new:
+    if job.discover_new and not is_cancel_requested(job_id):
         update_job(
             job_id,
             message=f"{club.name}: sprawdzanie listy filmów",
@@ -506,6 +514,10 @@ def process_club(job_id, job, club):
             for index, video_id in enumerate(
                 candidates[:job.max_details]
             ):
+                if is_cancel_requested(job_id):
+                    print("Przerwano wykrywanie nowych filmów.")
+                    break
+
                 if saved >= job.max_new:
                     break
 
@@ -555,8 +567,13 @@ def process_club(job_id, job, club):
             print(f"Błąd listy filmów @{handle}: {error}")
 
     # Nowe snapshoty filmów już zapisanych w bazie.
-    if job.refresh_existing:
+    if job.refresh_existing and not is_cancel_requested(job_id):
         for index, (url, video_id) in enumerate(existing):
+                
+            if is_cancel_requested(job_id):
+                print("Przerwano odświeżanie filmów.")
+                break
+
             update_job(
                 job_id,
                 message=f"{club.name}: odświeżanie filmu {index + 1}",
@@ -578,11 +595,27 @@ def process_club(job_id, job, club):
     return errors
 
 
+
 def run_worker(job_id):
+    from collection_job_management import WebCollectionJobClub
+
+    # Rozpoczęcie zadania
     with SessionLocal.begin() as db:
         job = db.get(WebCollectionJob, job_id)
 
-        if job is None or job.status != "queued":
+        if job is None:
+            return 1
+
+        # Anulowanie mogło nastąpić, zanim worker wystartował.
+        if job.status == "cancel_requested":
+            job.status = "cancelled"
+            job.active_slot = None
+            job.finished_at = utc_now()
+            job.heartbeat_at = utc_now()
+            job.message = "Anulowano przed rozpoczęciem."
+            return 0
+
+        if job.status != "queued":
             return 1
 
         job.status = "running"
@@ -591,6 +624,7 @@ def run_worker(job_id):
         job.message = "Rozpoczynam pobieranie."
 
     try:
+        # Pobieramy listę klubów z zadania.
         with SessionLocal() as db:
             job = db.get(WebCollectionJob, job_id)
 
@@ -605,68 +639,173 @@ def run_worker(job_id):
                 .order_by(Club.name.asc())
             ).all()
 
-            # Odłączamy obiekty od sesji przed jej zamknięciem.
             for club in clubs:
                 db.expunge(club)
 
         for index, club in enumerate(clubs):
-            update_job(
-                job_id,
-                message=f"Klub {index + 1}/{len(clubs)}: {club.name}",
+
+            # Nie rozpoczynamy kolejnego klubu po anulowaniu.
+            if is_cancel_requested(job_id):
+                print("Zadanie anulowane przed kolejnym klubem.")
+                break
+
+            print(
+                f"\n=== {club.name} "
+                f"(@{club.tiktok_handle}) ===",
+                flush=True,
             )
 
-            print(f"\n=== {club.name} (@{club.tiktok_handle}) ===")
+            # Zapisujemy rozpoczęcie obsługi danego klubu
+            # oraz liczniki sprzed przetwarzania.
+            with SessionLocal.begin() as db:
+                job = db.get(WebCollectionJob, job_id)
+
+                before_new = job.new_videos
+                before_refreshed = job.refreshed_videos
+                before_followers = job.followers_saved
+
+                club_result = WebCollectionJobClub(
+                    job_id=job_id,
+                    club_id=club.id,
+                    club_name=club.name,
+                    status="running",
+                    started_at=utc_now(),
+                    message="Rozpoczęto pobieranie.",
+                )
+
+                db.add(club_result)
+                db.flush()
+                result_id = club_result.id
+
+            update_job(
+                job_id,
+                message=(
+                    f"Klub {index + 1}/{len(clubs)}: "
+                    f"{club.name}"
+                ),
+            )
+
+            errors = 0
 
             try:
                 with SessionLocal() as db:
                     job = db.get(WebCollectionJob, job_id)
-                    errors = process_club(job_id, job, club)
 
-                update_job(
-                    job_id,
-                    completed_clubs=1,
-                    errors_count=errors,
-                )
+                    errors = process_club(
+                        job_id,
+                        job,
+                        club,
+                    )
 
             except Exception as error:
-                print(f"Błąd przetwarzania klubu: {error}")
-                update_job(
-                    job_id,
-                    completed_clubs=1,
-                    errors_count=1,
+                errors = 1
+                print(
+                    f"Błąd przetwarzania klubu: {error}",
+                    flush=True,
                 )
+
+            # Zapisujemy szczegółowe wyniki tego klubu.
+            with SessionLocal.begin() as db:
+                job = db.get(WebCollectionJob, job_id)
+                club_result = db.get(
+                    WebCollectionJobClub,
+                    result_id,
+                )
+
+                club_result.new_videos = max(
+                    0,
+                    job.new_videos - before_new,
+                )
+
+                club_result.refreshed_videos = max(
+                    0,
+                    job.refreshed_videos - before_refreshed,
+                )
+
+                club_result.followers_saved = max(
+                    0,
+                    job.followers_saved - before_followers,
+                )
+
+                club_result.errors_count = errors
+                club_result.finished_at = utc_now()
+
+                if job.status == "cancel_requested":
+                    club_result.status = "cancelled"
+                    club_result.message = (
+                        "Przerwano na żądanie użytkownika."
+                    )
+                elif errors > 0:
+                    club_result.status = "partial"
+                    club_result.message = (
+                        "Zakończono z błędami."
+                    )
+                else:
+                    club_result.status = "completed"
+                    club_result.message = (
+                        "Zakończono poprawnie."
+                    )
+
+                job.completed_clubs += 1
+                job.errors_count += errors
+                job.heartbeat_at = utc_now()
+
+            if is_cancel_requested(job_id):
+                break
 
             if index < len(clubs) - 1:
                 time.sleep(10)
 
+        # Końcowe podsumowanie całego zadania.
         with SessionLocal.begin() as db:
             job = db.get(WebCollectionJob, job_id)
 
-            job.status = (
-                "completed"
-                if job.errors_count == 0
-                else "partial"
-            )
+            if job.status == "cancel_requested":
+                job.status = "cancelled"
+                job.message = (
+                    "Zadanie anulowano. "
+                    "Zachowano wcześniej zapisane dane."
+                )
+
+            elif job.errors_count > 0:
+                job.status = "partial"
+                job.message = (
+                    "Zakończono z błędami."
+                )
+
+            else:
+                job.status = "completed"
+                job.message = (
+                    "Zakończono zbieranie danych."
+                )
+
             job.active_slot = None
             job.finished_at = utc_now()
             job.heartbeat_at = utc_now()
-            job.message = "Zakończono zbieranie danych."
 
         return 0
 
     except Exception as error:
-        print(f"KRYTYCZNY BŁĄD ZADANIA: {error}")
+        print(
+            f"KRYTYCZNY BŁĄD ZADANIA: {error}",
+            flush=True,
+        )
 
         with SessionLocal.begin() as db:
             job = db.get(WebCollectionJob, job_id)
+
             if job is not None:
                 job.status = "failed"
                 job.active_slot = None
                 job.finished_at = utc_now()
-                job.message = "Zadanie przerwane błędem."
+                job.heartbeat_at = utc_now()
                 job.errors_count += 1
+                job.message = (
+                    "Zadanie przerwane błędem."
+                )
 
         return 1
+
 
 
 if __name__ == "__main__":

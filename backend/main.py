@@ -10,6 +10,9 @@ from engagement_routes import router as engagement_router
 from rankings_routes import router as rankings_router
 from monitoring_routes import router as monitoring_router
 from web_collection_routes import router as web_collection_router
+from collection_job_management import (
+    router as collection_management_router
+)
 
 from database import Base, engine, get_db
 from models import Club, ProfileSnapshot
@@ -39,7 +42,8 @@ app.include_router(engagement_router)
 app.include_router(rankings_router)
 app.include_router(monitoring_router)
 app.include_router(web_collection_router)
-# Połączenie z frontendem Next.js
+app.include_router(collection_management_router)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
