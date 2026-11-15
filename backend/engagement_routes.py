@@ -1,19 +1,17 @@
-"""FSI 0.7.2: Engagement Analytics dla filmów TikTok."""
-
 from datetime import date, datetime, time, timedelta
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
 from database import SessionLocal
 from models import Club, Video, VideoSnapshot
 
-router = APIRouter(prefix="/api", tags=["Engagement Analytics"])
-MIN_RANKING_VIEWS = 1000
+router = APIRouter(prefix="/api/rankings", tags=["rankings"])
 
 
-def get_engagement_db():
+def get_db():
     db = SessionLocal()
     try:
         yield db
@@ -21,140 +19,121 @@ def get_engagement_db():
         db.close()
 
 
-@router.get("/clubs/{club_id}/engagement")
-def get_club_engagement(
-    club_id: int,
+@router.get("/clubs")
+def get_club_rankings(
     start_date: date | None = None,
     end_date: date | None = None,
-    db: Session = Depends(get_engagement_db),
+    sort_by: Literal["views", "avg_views", "er"] = "avg_views",
+    min_videos: int = Query(1, ge=1, le=100),
+    db: Session = Depends(get_db),
 ):
-    club = db.get(Club, club_id)
-    if club is None:
-        raise HTTPException(status_code=404, detail="Nie znaleziono klubu")
-
     if start_date and end_date and start_date > end_date:
-        raise HTTPException(
-            status_code=422,
-            detail="Data początkowa jest późniejsza niż końcowa",
-        )
+        raise HTTPException(status_code=422, detail="Nieprawidłowy zakres dat")
 
-    # Jeden, najnowszy snapshot na film; ID rozstrzyga remisy czasu.
+    # Daty ograniczają czas PUBLIKACJI, a nie czas zdobycia wyświetleń.
+    video_join = [Video.club_id == Club.id]
+    if start_date:
+        video_join.append(Video.published_at >= datetime.combine(start_date, time.min))
+    if end_date:
+        video_join.append(Video.published_at < datetime.combine(end_date + timedelta(days=1), time.min))
+
+    # Dla każdego filmu bierzemy wyłącznie najnowszy snapshot.
     latest_snapshot_id = (
         select(VideoSnapshot.id)
         .where(VideoSnapshot.video_id == Video.id)
-        .order_by(
-            VideoSnapshot.collected_at.desc(),
-            VideoSnapshot.id.desc(),
-        )
+        .order_by(VideoSnapshot.collected_at.desc(), VideoSnapshot.id.desc())
         .limit(1)
         .correlate(Video)
         .scalar_subquery()
     )
 
-    filters = [Video.club_id == club_id]
-    if start_date:
-        filters.append(
-            Video.published_at >= datetime.combine(start_date, time.min)
-        )
-    if end_date:
-        filters.append(
-            Video.published_at < datetime.combine(
-                end_date + timedelta(days=1), time.min
-            )
-        )
+    # ER liczymy tylko wtedy, gdy wszystkie metryki są dostępne.
+    complete = and_(
+        VideoSnapshot.views_count.is_not(None),
+        VideoSnapshot.views_count > 0,
+        VideoSnapshot.likes_count.is_not(None),
+        VideoSnapshot.comments_count.is_not(None),
+        VideoSnapshot.shares_count.is_not(None),
+    )
 
-    rows = db.execute(
-        select(Video, VideoSnapshot)
-        .select_from(Video)
+    stmt = (
+        select(
+            Club.id.label("club_id"),
+            Club.name.label("club_name"),
+            Club.tiktok_handle.label("tiktok_handle"),
+            func.count(Video.id).label("videos_total"),
+            func.count(VideoSnapshot.views_count).label("videos_with_views"),
+            func.sum(VideoSnapshot.views_count).label("total_views"),
+            func.sum(case((complete, 1), else_=0)).label("videos_with_complete_er"),
+            func.sum(case((complete, VideoSnapshot.views_count), else_=0)).label("er_views"),
+            func.sum(
+                case(
+                    (
+                        complete,
+                        VideoSnapshot.likes_count
+                        + VideoSnapshot.comments_count
+                        + VideoSnapshot.shares_count,
+                    ),
+                    else_=0,
+                )
+            ).label("er_interactions"),
+        )
+        .select_from(Club)
+        .outerjoin(Video, and_(*video_join))
         .outerjoin(VideoSnapshot, VideoSnapshot.id == latest_snapshot_id)
-        .where(*filters)
-    ).all()
+        .where(Club.is_active.is_(True))
+        .group_by(Club.id, Club.name, Club.tiktok_handle)
+    )
 
-    complete = []
-    excluded = 0
-    included_views = 0
-    included_interactions = 0
+    clubs = []
+    for row in db.execute(stmt).mappings():
+        videos_total = int(row["videos_total"])
+        with_views = int(row["videos_with_views"])
+        complete_count = int(row["videos_with_complete_er"] or 0)
+        total_views = int(row["total_views"]) if with_views else None
+        er_views = int(row["er_views"] or 0)
+        er_interactions = int(row["er_interactions"] or 0)
+        average_views = round(total_views / with_views, 1) if with_views else None
+        er = round(100 * er_interactions / er_views, 2) if er_views > 0 else None
 
-    for video, snapshot in rows:
-        if snapshot is None:
-            excluded += 1
-            continue
+        metric = {"views": total_views, "avg_views": average_views, "er": er}[sort_by]
+        eligible_videos = complete_count if sort_by == "er" else with_views
+        eligible = eligible_videos >= min_videos and metric is not None
 
-        views = snapshot.views_count
-        likes = snapshot.likes_count
-        comments = snapshot.comments_count
-        shares = snapshot.shares_count
-
-        # Brak danych != zero. Z zerowym licznikiem wyświetleń nie
-        # można obliczyć procentowego współczynnika zaangażowania.
-        if any(value is None for value in (views, likes, comments, shares)):
-            excluded += 1
-            continue
-
-        if views <= 0 or any(value < 0 for value in (likes, comments, shares)):
-            excluded += 1
-            continue
-
-        interactions = likes + comments + shares
-        engagement_rate = interactions / views * 100
-
-        included_views += views
-        included_interactions += interactions
-
-        complete.append({
-            "video_id": video.id,
-            "tiktok_video_id": video.tiktok_video_id,
-            "url": video.url,
-            "description": video.description,
-            "published_at": (
-                video.published_at.isoformat() + "Z"
-                if video.published_at else None
-            ),
-            "collected_at": snapshot.collected_at.isoformat() + "Z",
-            "views": views,
-            "likes": likes,
-            "comments": comments,
-            "shares": shares,
-            "interactions": interactions,
-            "engagement_rate": round(engagement_rate, 2),
-            "_raw_rate": engagement_rate,
+        clubs.append({
+            "club_id": row["club_id"],
+            "club_name": row["club_name"],
+            "tiktok_handle": row["tiktok_handle"],
+            "videos_total": videos_total,
+            "videos_with_views": with_views,
+            "videos_with_complete_er": complete_count,
+            "total_views": total_views,
+            "average_views": average_views,
+            "weighted_er": er,
+            "eligible": eligible,
+            "rank": None,
+            "_metric": metric,
         })
 
-    ranked = [
-        {key: value for key, value in item.items() if key != "_raw_rate"}
-        for item in sorted(
-            (item for item in complete if item["views"] >= MIN_RANKING_VIEWS),
-            key=lambda item: (item["_raw_rate"], item["views"]),
-            reverse=True,
-        )[:10]
-    ]
+    clubs.sort(key=lambda c: (
+        not c["eligible"],
+        -(c["_metric"] if c["eligible"] else 0),
+        c["club_name"].casefold(),
+    ))
+
+    ranked = 0
+    for club in clubs:
+        if club["eligible"]:
+            ranked += 1
+            club["rank"] = ranked
+        del club["_metric"]
 
     return {
-        "club_id": club.id,
-        "club_name": club.name,
-        "filters": {
-            "start_date": start_date.isoformat() if start_date else None,
-            "end_date": end_date.isoformat() if end_date else None,
-        },
-        "summary": {
-            "videos_total": len(rows),
-            "videos_complete": len(complete),
-            "videos_excluded": excluded,
-            "included_views": included_views,
-            "included_interactions": included_interactions,
-            "weighted_engagement_rate": (
-                round(included_interactions / included_views * 100, 2)
-                if included_views > 0 else None
-            ),
-            "average_engagement_rate": (
-                round(
-                    sum(item["_raw_rate"] for item in complete)
-                    / len(complete),
-                    2,
-                )
-                if complete else None
-            ),
-        },
-        "minimum_views_for_ranking": MIN_RANKING_VIEWS,
-        "top_videos": ranked,
+        "sort_by": sort_by,
+        "min_videos": min_videos,
+        "start_date": start_date.isoformat() if start_date else None,
+        "end_date": end_date.isoformat() if end_date else None,
+        "clubs_total": len(clubs),
+        "clubs_ranked": ranked,
+        "clubs": clubs,
     }
